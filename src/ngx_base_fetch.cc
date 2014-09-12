@@ -17,6 +17,7 @@
 // Author: jefftk@google.com (Jeff Kaufman)
 
 #include "ngx_base_fetch.h"
+#include "ngx_base_fetch_connection.h"
 #include "ngx_list_iterator.h"
 
 #include "ngx_pagespeed.h"
@@ -28,7 +29,7 @@
 
 namespace net_instaweb {
 
-NgxBaseFetch::NgxBaseFetch(ngx_http_request_t* r, int pipe_fd,
+NgxBaseFetch::NgxBaseFetch(ngx_http_request_t* r,
                            NgxServerContext* server_context,
                            const RequestContextPtr& request_ctx,
                            PreserveCachingHeaders preserve_caching_headers)
@@ -37,10 +38,10 @@ NgxBaseFetch::NgxBaseFetch(ngx_http_request_t* r, int pipe_fd,
       server_context_(server_context),
       done_called_(false),
       last_buf_sent_(false),
-      pipe_fd_(pipe_fd),
       references_(2),
-      handle_error_(true),
-      preserve_caching_headers_(preserve_caching_headers) {
+      ipro_lookup_(false),
+      preserve_caching_headers_(preserve_caching_headers),
+      detached_(false) {
   if (pthread_mutex_init(&mutex_, NULL)) CHECK(0);
 }
 
@@ -115,21 +116,17 @@ ngx_int_t NgxBaseFetch::CollectHeaders(ngx_http_headers_out_t* headers_out) {
                                       preserve_caching_headers_);
 }
 
-void NgxBaseFetch::RequestCollection() {
-  int rc;
-  char c = 'A';  // What byte we write is arbitrary.
-  while (true) {
-    rc = write(pipe_fd_, &c, 1);
-    if (rc == 1) {
-      break;
-    } else if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-      // TODO(jefftk): is this rare enough that spinning isn't a problem?  Could
-      // we get into a case where the pipe fills up and we spin forever?
-
-    } else {
-      perror("NgxBaseFetch::RequestCollection");
-      break;
-    }
+void NgxBaseFetch::RequestCollection(char type) {
+  // We must optimistically increment the refcount, and decrement it
+  // when we conclude we failed. If we only increment on a successfull write,
+  // there's a small chance that between writing and adding to the refcount
+  // both pagespeed and nginx will release their refcount -- destructing
+  // this NgxBaseFetch instance,.
+  Addref();
+  if (!NgxBaseFetchConnection::WriteEvent(type, this)) {
+    Release();
+    // TODO(oschaaf): only check fail if not shutting down.
+    CHECK(false) << "Aaargh";
   }
 }
 
@@ -137,30 +134,42 @@ void NgxBaseFetch::HandleHeadersComplete() {
   int status_code = response_headers()->status_code();
   bool status_ok = (status_code != 0) && (status_code < 400);
 
-  if (status_ok || handle_error_) {
+  if (!ipro_lookup_ || status_ok) {
     // If this is a 404 response we need to count it in the stats.
     if (response_headers()->status_code() == HttpStatus::kNotFound) {
       server_context_->rewrite_stats()->resource_404_count()->Add(1);
     }
   }
 
-  RequestCollection();  // Headers available.
+  // For the IPRO lookup, supress notification of the nginx side here.
+  // If we send both this event and the one from done, nasty stuff will happen
+  // if we loose the race with with the nginx side destructing this base fetch
+  // instance (and thereby clearing the byte and its pending extraneous event.
+  if (!ipro_lookup_) {
+    RequestCollection(kHeadersComplete);  // Headers available.
+  }
 }
 
 bool NgxBaseFetch::HandleFlush(MessageHandler* handler) {
-  RequestCollection();  // A new part of the response body is available.
+  RequestCollection(kFlush);  // A new part of the response body is available
   return true;
 }
 
-void NgxBaseFetch::Release() {
-  DecrefAndDeleteIfUnreferenced();
+int NgxBaseFetch::Release() {
+  return DecrefAndDeleteIfUnreferenced();
 }
 
-void NgxBaseFetch::DecrefAndDeleteIfUnreferenced() {
+int NgxBaseFetch::Addref() {
+  return __sync_add_and_fetch(&references_, 1);
+}
+
+int NgxBaseFetch::DecrefAndDeleteIfUnreferenced() {
   // Creates a full memory barrier.
-  if (__sync_add_and_fetch(&references_, -1) == 0) {
+  int r = __sync_add_and_fetch(&references_, -1);
+  if (r == 0) {
     delete this;
   }
+  return r;
 }
 
 void NgxBaseFetch::HandleDone(bool success) {
@@ -169,10 +178,7 @@ void NgxBaseFetch::HandleDone(bool success) {
   Lock();
   done_called_ = true;
   Unlock();
-
-  close(pipe_fd_);  // Indicates to nginx that we're done with the rewrite.
-  pipe_fd_ = -1;
-
+  RequestCollection(kDone);
   DecrefAndDeleteIfUnreferenced();
 }
 

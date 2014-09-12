@@ -215,7 +215,19 @@ namespace net_instaweb {
 
   void NgxUrlAsyncFetcher::ShutDown() {
       shutdown_ = true;
-      SendCmd('S');
+      if (!pending_fetches_.empty()) {
+        pending_fetches_.DeleteAll();
+      }
+
+      if (!active_fetches_.empty()) {
+        for (Pool<NgxFetch>::iterator p = active_fetches_.begin(),
+                 e = active_fetches_.end(); p != e; p++) {
+          NgxFetch* fetch = *p;
+          fetch->CallbackDone(false);
+        }
+        active_fetches_.Clear();
+      }
+      // SendCmd('S');
   }
 
   // It's called in the rewrite thread. All the fetches are started at

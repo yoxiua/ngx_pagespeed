@@ -55,8 +55,7 @@ namespace net_instaweb {
 
 class NgxBaseFetch : public AsyncFetch {
  public:
-  NgxBaseFetch(ngx_http_request_t* r, int pipe_fd,
-               NgxServerContext* server_context,
+  NgxBaseFetch(ngx_http_request_t* r, NgxServerContext* server_context,
                const RequestContextPtr& request_ctx,
                PreserveCachingHeaders preserve_caching_headers);
   virtual ~NgxBaseFetch();
@@ -77,19 +76,26 @@ class NgxBaseFetch : public AsyncFetch {
   // time for resource fetches.  Not called at all for proxy fetches.
   ngx_int_t CollectHeaders(ngx_http_headers_out_t* headers_out);
 
-  // Called by nginx when it's done with us.
-  void Release();
-  void set_handle_error(bool x) { handle_error_ = x; }
+  // Called by nginx when it's done with us, or a read event was processed.
+  int Release();
+  // Called by us when we requested a collection
+  int Addref();
+  void set_ipro_lookup(bool x) { ipro_lookup_ = x; }
+  // TODO(oschaaf): doc
+  bool IsDetached() { return detached_; }
+  // TODO(oschaaf): doc. pull in decrementing & move to .cc
+  void Detach() { detached_ = true; }
+  ngx_http_request_t* request() { return request_; };
 
  private:
   virtual bool HandleWrite(const StringPiece& sp, MessageHandler* handler);
   virtual bool HandleFlush(MessageHandler* handler);
   virtual void HandleHeadersComplete();
   virtual void HandleDone(bool success);
-
+ 
   // Indicate to nginx that we would like it to call
   // CollectAccumulatedWrites().
-  void RequestCollection();
+  void RequestCollection(char type);
 
   // Lock must be acquired first.
   // Returns:
@@ -105,21 +111,23 @@ class NgxBaseFetch : public AsyncFetch {
 
   // Called by Done() and Release().  Decrements our reference count, and if
   // it's zero we delete ourself.
-  void DecrefAndDeleteIfUnreferenced();
+  int DecrefAndDeleteIfUnreferenced();
 
   ngx_http_request_t* request_;
   GoogleString buffer_;
   NgxServerContext* server_context_;
   bool done_called_;
   bool last_buf_sent_;
-  int pipe_fd_;
   // How many active references there are to this fetch. Starts at two,
   // decremented once when Done() is called and once when Release() is called.
+  // Incremented for each event written on the pagespeed_connection, and
+  // decremented on the other side for each event read.
   int references_;
   pthread_mutex_t mutex_;
-  bool handle_error_;
+  bool ipro_lookup_;
   PreserveCachingHeaders preserve_caching_headers_;
-
+  // Set to true just before the nginx side releases its reference
+  bool detached_;
   DISALLOW_COPY_AND_ASSIGN(NgxBaseFetch);
 };
 
