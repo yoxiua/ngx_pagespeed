@@ -302,8 +302,8 @@ fi
 #
 # TODO(sligicki): When the prioritize critical css race condition is fixed, the
 # two prioritize_critical_css tests no longer need to be listed here.
-# TODO(oschaaf): Now that we wait after we send a SIGHUP for the new worker 
-# process to handle requests, check if we can remove more from the expected 
+# TODO(oschaaf): Now that we wait after we send a SIGHUP for the new worker
+# process to handle requests, check if we can remove more from the expected
 # failures here under valgrind.
 if $USE_VALGRIND; then
     PAGESPEED_EXPECTED_FAILURES+="
@@ -546,28 +546,49 @@ check test $(scrape_stat image_rewrite_total_original_bytes) -ge 10000
 start_test "Reload config"
 
 # Fire up some heavy load if ab is available to test a stressed reload.
-# TODO(oschaaf): make sure we wait for the new worker to get ready to accept 
+# TODO(oschaaf): make sure we wait for the new worker to get ready to accept
 # requests.
 fire_ab_load
 
 check wget $EXAMPLE_ROOT/styles/W.rewrite_css_images.css.pagespeed.cf.Hash.css \
   -O /dev/null
 check_simple "$NGINX_EXECUTABLE" -s reload -c "$PAGESPEED_CONF"
+
 # Wait for the new worker process with the new configuration to get ready, or
 # else the sudden reset of the shared mem statistics/cache might catch upcoming
 # tests unaware.
-while [ $(scrape_stat image_rewrite_total_original_bytes) -gt 0 ]
-do
+function wait_for_new_worker() {
+  while [ $(scrape_stat image_rewrite_total_original_bytes) -gt 0 ]; do
     echo "Waiting for new worker to get ready..."
     sleep .1
-done
-
+  done
+}
+wait_for_new_worker
 check wget $EXAMPLE_ROOT/styles/W.rewrite_css_images.css.pagespeed.cf.Hash.css \
   -O /dev/null
 if [ "$AB_PID" != "0" ]; then
     echo "Kill ab (pid: $AB_PID)"
     kill -s KILL $AB_PID &>/dev/null || true
 fi
+
+start_test "Shared memory checkpointing"
+
+# Checkpoint beacon results to disk if we haven't already.
+test_prioritize_critical_css
+sleep 2
+test_prioritize_critical_css
+
+# Reload nginx again.
+check_simple "$NGINX_EXECUTABLE" -s reload -c "$PAGESPEED_CONF"
+wait_for_new_worker
+
+# This will only pass if we persisted the metadata across restarts.
+test_prioritize_critical_css_final
+
+
+# The beacon responses are stored in the metadata cache, so this can only pass
+# if we persisted the cache.
+test_prioritize_critical_css_final
 
 # This is dependent upon having a beacon handler.
 test_filter add_instrumentation beacons load.
